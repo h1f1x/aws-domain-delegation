@@ -1,0 +1,209 @@
+#!/usr/bin/env python
+import sys
+import time
+
+import boto3
+import click
+
+from utils_aws import with_role
+
+AWS_ASSUME_ROLE = None
+
+
+class Domainconfig(object):
+
+    def __init__(self, account, domain):
+        self.account = account
+        self.domain = domain
+        self.zone = None
+        self.is_subdomain = False
+        self.ns = None
+
+    def __repr__(self):
+        return f"""
+        Account:        {self.account}
+        Domain:         {self.domain}
+        Zone:           {self.zone}
+        Is subdomain:   {self.is_subdomain}
+        Nameservers:    {self.ns}
+        """
+
+
+@click.command()
+@click.option('--domain', prompt='FQDN (Subdomain)', help='The full domain name you wanna host in the target account.')
+@click.option('--source', prompt='Parent Domains AWS Account ID', help='The AWS Account with the parent domain.')
+@click.option('--target', prompt='Target AWS Account ID', help='AWS Account ID you want to delegate the domain to.')
+@click.option('--dryrun', '-n', is_flag=True, help='This will skip the real creation of resources')
+@click.option('--assume-role', '-a', default='Administrator', help='This role will be assumed in the accounts.')
+def run(domain, source, target, dryrun, assume_role):
+    """
+    Delegate the domain responsibility from the source account to the target account.
+    The source account is hosting the zone of the (parent)domain.
+    A subdomain entry will be created in this zone.
+    In the target account, a zone for the (sub)domain will be created. 
+    The nameserver of this (target) zone will be used in the source accounts subdomain entry.
+
+    You need to run this with aws credentials for a role which can assume a role in the source and target account, 
+    which is able to modify the route53 config.
+    """
+    global AWS_ASSUME_ROLE
+    AWS_ASSUME_ROLE = assume_role
+    source_config = fetch_configs(source, domain)
+    target_config = fetch_configs(target, domain)
+    exit_if_config_cannot_continue(source_config, target_config)
+    if dryrun:
+        click.secho('[DRY RUN] Skipping delegation!', fg='green')
+    else:
+        delegate(source_config, target_config)
+    click.secho('Subdomain should now be delegated!', fg='green')
+
+
+def fetch_configs(account, domain):
+    config = Domainconfig(account=account, domain=domain)
+    config.zone = lookup_zone_id(domain, account)
+    if config.zone is None:
+        config.is_subdomain = True
+        config.zone = lookup_zone_id(parent_domain(domain), account)
+    if config.zone is not None:
+        if config.is_subdomain:
+            config.ns = lookup_subdomain_name_servers(config.zone, account, domain)
+        else:
+            config.ns = lookup_name_servers(config.zone, account)
+    return config
+
+
+def lookup_zone_id(domain, account):
+    dns_name = domain + '.'
+    client = with_role(account_id=account, role=AWS_ASSUME_ROLE)(
+        boto3.client)('route53')
+    paginator = client.get_paginator('list_hosted_zones')
+    page_iterator = paginator.paginate()
+    for page in page_iterator:
+        for zone in page['HostedZones']:
+            if zone['Name'] == dns_name:
+                return zone['Id']
+
+
+def lookup_subdomain_name_servers(zone, account, domain):
+    dns_name = domain + '.'
+    client = with_role(account_id=account, role='Mozart')(
+        boto3.client)('route53')
+    paginator = client.get_paginator('list_resource_record_sets')
+    page_iterator = paginator.paginate(HostedZoneId=zone)
+    for page in page_iterator:
+        for recordset in page['ResourceRecordSets']:
+            if recordset['Name'] == dns_name and recordset['Type'] == 'NS':
+                result = [e['Value'] for e in recordset['ResourceRecords']]
+                result.sort()
+                return result
+
+
+def lookup_name_servers(zone, account):
+    client = with_role(account_id=account, role='Mozart')(
+        boto3.client)('route53')
+    response = client.get_hosted_zone(Id=zone)
+    result = response['DelegationSet']['NameServers']
+    # bugfix: strand ending dot to servernames
+    # as api endpoints behave different and this stupid one, does strip it
+    result = [e + '.' for e in result]
+    result.sort()
+    return result
+
+
+def exit_if_config_cannot_continue(source, target):
+    abort_message = ''
+    if not check_account_has_parent_zone(source):
+        abort_message += 'Parent Zone missconfiguration. Expected parent domain as zone in source account.'
+    if check_account_has_parent_zone(target):
+        abort_message += 'Parent Zone missconfiguration. Expected parent domain as zone in source not target account.'
+    if check_already_correctly_configured(source, target):
+        abort_message += 'This delegation is already configured!'
+    if not check_zone_has_nameserver(target):
+        abort_message += 'Target zone exists, but has no nameserver.'
+    show_config(source, target)
+    if abort_message != '':
+        click.secho(abort_message, fg='yellow')
+        click.secho('Delegation not possible with existing configurations.', fg='red')
+        sys.exit(2)
+
+
+def show_config(source, target):
+    click.echo('   Configurations:')
+    click.echo('   Source Account:')
+    click.echo(source)
+    click.echo('   ' + '-'*30)
+    click.echo('   Target Account:')
+    click.echo(target)
+
+
+def check_account_has_parent_zone(config):
+    return config.is_subdomain and config.zone
+
+
+def check_already_correctly_configured(source, target):
+    return source.ns and source.ns == target.ns
+
+
+def check_zone_has_nameserver(config):
+    # An AWS zone always has NS, otherwise the zone is somewhat broken
+    return config.zone and config.ns
+
+
+def delegate(source, target):
+    if not target.zone:
+        click.secho('[*] Creating target zone ...')
+        target.ns = create_zone(target)
+    click.secho('[*] Creating/Updating subdomain in source (parent domain) zone ...')
+    source.ns = target.ns
+    upsert_subdomain(source)
+
+
+def create_zone(config):
+    client = with_role(account_id=config.account, role='Mozart')(boto3.client)('route53')
+    response = client.create_hosted_zone(
+        Name=config.domain,
+        CallerReference=str(time.time()),
+        HostedZoneConfig={
+            'Comment': 'Delegated',
+            'PrivateZone': False
+        }
+    )
+    return response['DelegationSet']['NameServers'].sort()
+
+
+def upsert_subdomain(config):
+    # check if we have a parent domain in the config
+    if not config.is_subdomain:
+        click.secho('ERROR: subdomain cannot be created.', fg='red')
+        sys.exit(1)
+    ns_records = [{'Value': e} for e in config.ns]
+    client = with_role(account_id=config.account, role='Mozart')(boto3.client)('route53')
+    response = client.change_resource_record_sets(
+        HostedZoneId=config.zone,
+        ChangeBatch={
+            'Comment': f'Add subdomain delegation for {config.domain}',
+            'Changes': [
+                {
+                    'Action': 'UPSERT',
+                    'ResourceRecordSet': {
+                        'Name': config.domain,
+                        'Type': 'NS',
+                        'TTL': 3600,
+                        'ResourceRecords': ns_records
+                    }
+                },
+            ]
+        }
+    )
+
+
+def parent_domain(domain):
+    return '.'.join(domain.split('.')[1:])
+
+
+def construct_reverse_dns_name(domain):
+    return '.'.join(reversed(domain.split('.'))) + '.'
+
+
+if __name__ == '__main__':
+    run()
