@@ -6,6 +6,7 @@ One has the domain, and transfers the (DNS) management of it to the other accoun
 
 ## Prerequisites
 
+- valid aws credentials in executing session
 - python
 - pipenv
 
