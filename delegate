@@ -62,8 +62,8 @@ def fetch_configs(account, domain):
     config = Domainconfig(account=account, domain=domain)
     config.zone = lookup_zone_id(domain, account)
     if config.zone is None:
-        config.is_subdomain = True
         config.zone = lookup_zone_id(parent_domain(domain), account)
+        config.is_subdomain = True if config.zone else False
     if config.zone is not None:
         if config.is_subdomain:
             config.ns = lookup_subdomain_name_servers(config.zone, account, domain)
@@ -111,6 +111,9 @@ def lookup_name_servers(zone, account):
 
 
 def exit_if_config_cannot_continue(source, target):
+    """
+    Checks the fetched configuration and decide if everything is ok to continue
+    """
     abort_message = ''
     if not check_account_has_parent_zone(source):
         abort_message += 'Parent Zone missconfiguration. Expected parent domain as zone in source account.'
@@ -118,7 +121,7 @@ def exit_if_config_cannot_continue(source, target):
         abort_message += 'Parent Zone missconfiguration. Expected parent domain as zone in source not target account.'
     if check_already_correctly_configured(source, target):
         abort_message += 'This delegation is already configured!'
-    if not check_zone_has_nameserver(target):
+    if check_zone_has_no_nameserver(target):
         abort_message += 'Target zone exists, but has no nameserver.'
     show_config(source, target)
     if abort_message != '':
@@ -144,9 +147,9 @@ def check_already_correctly_configured(source, target):
     return source.ns and source.ns == target.ns
 
 
-def check_zone_has_nameserver(config):
+def check_zone_has_no_nameserver(config):
     # An AWS zone always has NS, otherwise the zone is somewhat broken
-    return config.zone and config.ns
+    return config.zone and not config.ns
 
 
 def delegate(source, target):
