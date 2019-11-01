@@ -103,8 +103,8 @@ def lookup_name_servers(zone, account):
         boto3.client)('route53')
     response = client.get_hosted_zone(Id=zone)
     result = response['DelegationSet']['NameServers']
-    # bugfix: strand ending dot to servernames
-    # as api endpoints behave different and this stupid one, does strip it
+    # bugfix: ending dots on servernames
+    # as aws api endpoints behave different - this stupid one, strips it
     result = [e + '.' for e in result]
     result.sort()
     return result
