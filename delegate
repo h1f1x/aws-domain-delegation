@@ -40,10 +40,10 @@ def run(domain, source, target, dryrun, assume_role):
     Delegate the domain responsibility from the source account to the target account.
     The source account is hosting the zone of the (parent)domain.
     A subdomain entry will be created in this zone.
-    In the target account, a zone for the (sub)domain will be created. 
+    In the target account, a zone for the (sub)domain will be created.
     The nameserver of this (target) zone will be used in the source accounts subdomain entry.
 
-    You need to run this with aws credentials for a role which can assume a role in the source and target account, 
+    You need to run this with aws credentials for a role which can assume a role in the source and target account,
     which is able to modify the route53 config.
     """
     global AWS_ASSUME_ROLE
@@ -86,7 +86,7 @@ def lookup_zone_id(domain, account):
 
 def lookup_subdomain_name_servers(zone, account, domain):
     dns_name = domain + '.'
-    client = with_role(account_id=account, role='Mozart')(
+    client = with_role(account_id=account, role=AWS_ASSUME_ROLE)(
         boto3.client)('route53')
     paginator = client.get_paginator('list_resource_record_sets')
     page_iterator = paginator.paginate(HostedZoneId=zone)
@@ -99,7 +99,7 @@ def lookup_subdomain_name_servers(zone, account, domain):
 
 
 def lookup_name_servers(zone, account):
-    client = with_role(account_id=account, role='Mozart')(
+    client = with_role(account_id=account, role=AWS_ASSUME_ROLE)(
         boto3.client)('route53')
     response = client.get_hosted_zone(Id=zone)
     result = response['DelegationSet']['NameServers']
@@ -162,7 +162,7 @@ def delegate(source, target):
 
 
 def create_zone(config):
-    client = with_role(account_id=config.account, role='Mozart')(boto3.client)('route53')
+    client = with_role(account_id=config.account, role=AWS_ASSUME_ROLE)(boto3.client)('route53')
     response = client.create_hosted_zone(
         Name=config.domain,
         CallerReference=str(time.time()),
@@ -180,7 +180,7 @@ def upsert_subdomain(config):
         click.secho('ERROR: subdomain cannot be created.', fg='red')
         sys.exit(1)
     ns_records = [{'Value': e} for e in config.ns]
-    client = with_role(account_id=config.account, role='Mozart')(boto3.client)('route53')
+    client = with_role(account_id=config.account, role=AWS_ASSUME_ROLE)(boto3.client)('route53')
     response = client.change_resource_record_sets(
         HostedZoneId=config.zone,
         ChangeBatch={
